@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI 手势 3D 彩色雾状粒子系统</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      color: #eaffff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    #app {
+      position: fixed;
+      inset: 0;
+      background: #000;
+    }
+
+    #ui {
+      position: fixed;
+      left: 18px;
+      top: 18px;
+      z-index: 10;
+      min-width: 210px;
+      padding: 12px 14px;
+      border: 1px solid rgba(130, 240, 255, 0.22);
+      border-radius: 10px;
+      background: rgba(3, 10, 16, 0.42);
+      backdrop-filter: blur(16px);
+      box-shadow: 0 0 38px rgba(42, 210, 255, 0.12);
+      pointer-events: none;
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      height: 26px;
+      font-size: 13px;
+      color: rgba(225, 255, 255, 0.72);
+    }
+
+    .value {
+      color: #efffff;
+      font-weight: 700;
+      text-shadow: 0 0 16px rgba(70, 220, 255, 0.75);
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      display: inline-block;
+      margin-right: 7px;
+      border-radius: 50%;
+      background: #ffcc66;
+      box-shadow: 0 0 14px #ffcc66;
+    }
+
+    .dot.ok {
+      background: #62ffb4;
+      box-shadow: 0 0 14px #62ffb4;
+    }
+
+    video {
+      position: fixed;
+      right: 14px;
+      bottom: 14px;
+      z-index: 3;
+      width: 168px;
+      height: 126px;
+      object-fit: cover;
+      transform: scaleX(-1);
+      opacity: 0.12;
+      border: 1px solid rgba(160, 235, 255, 0.14);
+      border-radius: 10px;
+      pointer-events: none;
+      filter: saturate(1.2) contrast(1.1);
+    }
+
+    #hint {
+      position: fixed;
+      left: 18px;
+      bottom: 16px;
+      z-index: 10;
+      color: rgba(220, 255, 255, 0.45);
+      font-size: 12px;
+      pointer-events: none;
+    }
+
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="ui">
+    <div class="row">
+      <span><i id="cameraDot" class="dot"></i>摄像头状态</span>
+      <span id="cameraStatus" class="value">初始化</span>
+    </div>
+    <div class="row">
+      <span>当前手势</span>
+      <span id="gestureStatus" class="value">等待识别</span>
+    </div>
+  </div>
+
+  <div id="hint">双击打开后允许摄像头权限，将手放入画面控制雾状粒子</div>
+  <video id="video" playsinline muted></video>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+
+  <script>
+    // =========================
+    // 基础 DOM
+    // =========================
+    const app = document.getElementById("app");
+    const video = document.getElementById("video");
+    const cameraDot = document.getElementById("cameraDot");
+    const cameraStatus = document.getElementById("cameraStatus");
+    const gestureStatus = document.getElementById("gestureStatus");
+
+    // =========================
+    // Three.js 场景初始化
+    // =========================
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x020409, 0.018);
+
+    const camera3D = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 260);
+    camera3D.position.set(0, 0, 72);
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: false,
+      powerPreference: "high-performance"
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000000, 1);
+    app.appendChild(renderer.domElement);
+
+    // =========================
+    // 性能参数
+    // =========================
+    const MAX_PARTICLES = 12000;
+    const MIN_VISIBLE_PARTICLES = 5600;
+
+    // 使用 BufferGeometry，避免每帧创建大量对象
+    const positions = new Float32Array(MAX_PARTICLES * 3);
+    const colors = new Float32Array(MAX_PARTICLES * 3);
+    const baseAngles = new Float32Array(MAX_PARTICLES);
+    const baseRadius = new Float32Array(MAX_PARTICLES);
+    const baseHeight = new Float32Array(MAX_PARTICLES);
+    const randomSeed = new Float32Array(MAX_PARTICLES);
+    const velocities = new Float32Array(MAX_PARTICLES * 3);
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geometry.setDrawRange(0, MAX_PARTICLES);
+
+    // 生成柔和圆形粒子贴图，让粒子像雾滴/星云尘埃
+    function createGlowTexture() {
+      const size = 128;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d");
+
+      const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+      gradient.addColorStop(0.0, "rgba(255,255,255,1)");
+      gradient.addColorStop(0.18, "rgba(255,255,255,0.92)");
+      gradient.addColorStop(0.42, "rgba(180,230,255,0.34)");
+      gradient.addColorStop(0.72, "rgba(110,150,255,0.11)");
+      gradient.addColorStop(1.0, "rgba(255,255,255,0)");
+
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, size, size);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+      return texture;
+    }
+
+    const particleMaterial = new THREE.PointsMaterial({
+      size: 0.82,
+      map: createGlowTexture(),
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.72,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      sizeAttenuation: true
+    });
+
+    const particles = new THREE.Points(geometry, particleMaterial);
+    scene.add(particles);
+
+    // 第二层更大更淡的雾，用同一份 geometry 叠加增强烟雾感
+    const hazeMaterial = new THREE.PointsMaterial({
+      size: 2.4,
+      map: createGlowTexture(),
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.12,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      sizeAttenuation: true
+    });
+
+    const haze = new THREE.Points(geometry, hazeMaterial);
+    haze.scale.setScalar(1.018);
+    scene.add(haze);
+
+    // 背景星尘层，增强空间景深
+    const starCount = 1800;
+    const starPositions = new Float32Array(starCount * 3);
+    const starColors = new Float32Array(starCount * 3);
+
+    for (let i = 0; i < starCount; i++) {
+      const i3 = i * 3;
+      starPositions[i3] = (Math.random() - 0.5) * 210;
+      starPositions[i3 + 1] = (Math.random() - 0.5) * 120;
+      starPositions[i3 + 2] = -80 - Math.random() * 110;
+
+      starColors[i3] = 0.35 + Math.random() * 0.25;
+      starColors[i3 + 1] = 0.65 + Math.random() * 0.25;
+      starColors[i3 + 2] = 1.0;
+    }
+
+    const starGeometry = new THREE.BufferGeometry();
+    starGeometry.setAttribute("position", new THREE.BufferAttribute(starPositions, 3));
+    starGeometry.setAttribute("color", new THREE.BufferAttribute(starColors, 3));
+
+    const starMaterial = new THREE.PointsMaterial({
+      size: 0.34,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.35,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+
+    const stars = new THREE.Points(starGeometry, starMaterial);
+    scene.add(stars);
+
+    // =========================
+    // 粒子初始分布
+    // =========================
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+      const i3 = i * 3;
+      const angle = Math.random() * Math.PI * 2;
+      const radius = Math.pow(Math.random(), 0.55) * 34;
+      const height = (Math.random() - 0.5) * 36;
+      const z = (Math.random() - 0.5) * 54;
+
+      baseAngles[i] = angle;
+      baseRadius[i] = radius;
+      baseHeight[i] = height;
+      randomSeed[i] = Math.random() * 1000;
+
+      positions[i3] = Math.cos(angle) * radius;
+      positions[i3 + 1] = height;
+      positions[i3 + 2] = Math.sin(angle) * radius + z * 0.32;
+
+      velocities[i3] = (Math.random() - 0.5) * 0.02;
+      velocities[i3 + 1] = (Math.random() - 0.5) * 0.02;
+      velocities[i3 + 2] = (Math.random() - 0.5) * 0.02;
+    }
+
+    // =========================
+    // 手势状态与平滑参数
+    // =========================
+    const state = {
+      gesture: "等待识别",
+      targetGesture: "等待识别",
+      expansion: 0.55,
+      targetExpansion: 0.55,
+      visibleCount: 8000,
+      targetVisibleCount: 8000,
+      glow: 1.0,
+      targetGlow: 1.0,
+      handX: 0,
+      targetHandX: 0,
+      handY: 0,
+      targetHandY: 0,
+      depthPower: 0.0,
+      targetDepthPower: 0.0,
+      flowX: 0,
+      targetFlowX: 0,
+      confidence: 0,
+      targetConfidence: 0,
+      lastHandSeen: 0
+    };
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function distance2D(a, b) {
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    // =========================
+    // 颜色渐变
+    // =========================
+    const colorA = new THREE.Color();
+    const colorB = new THREE.Color();
+    const colorC = new THREE.Color();
+    const tempColor = new THREE.Color();
+
+    function setNebulaColor(t, redPurpleAmount, brightness) {
+      // 蓝、紫、青、粉动态渐变，握拳时增加红紫
+      const hueShift = (t * 0.035) % 1;
+
+      colorA.setHSL(0.52 + hueShift * 0.08, 1.0, 0.58 * brightness);
+      colorB.setHSL(0.74 + hueShift * 0.08, 0.95, 0.62 * brightness);
+      colorC.setHSL(0.90 + hueShift * 0.06, 0.95, 0.62 * brightness);
+
+      const redPurple = new THREE.Color().setHSL(0.88, 1.0, 0.54 * brightness);
+      colorA.lerp(redPurple, redPurpleAmount * 0.35);
+      colorB.lerp(redPurple, redPurpleAmount * 0.55);
+      colorC.lerp(redPurple, redPurpleAmount * 0.72);
+    }
+
+    // =========================
+    // MediaPipe Hands 手势识别
+    // =========================
+    function isFingerExtended(landmarks, tip, pip, mcp, wrist) {
+      const tipDist = distance2D(landmarks[tip], wrist);
+      const pipDist = distance2D(landmarks[pip], wrist);
+      const mcpDist = distance2D(landmarks[mcp], wrist);
+      return tipDist > pipDist * 1.08 && tipDist > mcpDist * 1.14;
+    }
+
+    function classifyHand(landmarks) {
+      const wrist = landmarks[0];
+
+      const thumbOpen = distance2D(landmarks[4], landmarks[17]) > distance2D(landmarks[3], landmarks[17]) * 1.08;
+      const indexOpen = isFingerExtended(landmarks, 8, 6, 5, wrist);
+      const middleOpen = isFingerExtended(landmarks, 12, 10, 9, wrist);
+      const ringOpen = isFingerExtended(landmarks, 16, 14, 13, wrist);
+      const pinkyOpen = isFingerExtended(landmarks, 20, 18, 17, wrist);
+
+      const openCount = [thumbOpen, indexOpen, middleOpen, ringOpen, pinkyOpen].filter(Boolean).length;
+
+      // 用手掌宽度和高度估算手是否靠近摄像头
+      const palmWidth = distance2D(landmarks[5], landmarks[17]);
+      const palmHeight = distance2D(landmarks[0], landmarks[9]);
+      const palmSize = clamp((palmWidth + palmHeight) * 1.9, 0, 1);
+
+      const centerX = landmarks.reduce((sum, p) => sum + p.x, 0) / landmarks.length;
+      const centerY = landmarks.reduce((sum, p) => sum + p.y, 0) / landmarks.length;
+
+      let gesture = "未识别";
+      let confidence = 0.35;
+
+      if (openCount >= 4) {
+        gesture = "张开手掌";
+        confidence = 0.86 + openCount * 0.025;
+      } else if (openCount <= 1) {
+        gesture = "握拳";
+        confidence = 0.9 - openCount * 0.08;
+      } else {
+        gesture = "半开手势";
+        confidence = 0.62;
+      }
+
+      return {
+        gesture,
+        confidence: clamp(confidence, 0, 1),
+        centerX,
+        centerY,
+        palmSize,
+        openCount
+      };
+    }
+
+    function applyGesture(result) {
+      state.lastHandSeen = performance.now();
+      state.targetGesture = result.gesture;
+      state.targetConfidence = result.confidence;
+
+      // 摄像头画面是镜像显示，控制方向也做镜像处理
+      const normalizedX = (0.5 - result.centerX) * 2;
+      const normalizedY = (result.centerY - 0.5) * 2;
+
+      state.targetHandX = clamp(normalizedX, -1, 1);
+      state.targetHandY = clamp(normalizedY, -1, 1);
+      state.targetFlowX = clamp(normalizedX * 1.6, -1.8, 1.8);
+      state.targetDepthPower = clamp((result.palmSize - 0.26) / 0.42, 0, 1);
+
+      if (result.gesture === "张开手掌") {
+        state.targetExpansion = 1.0;
+        state.targetVisibleCount = MAX_PARTICLES;
+        state.targetGlow = 1.2 + state.targetDepthPower * 1.35;
+      } else if (result.gesture === "握拳") {
+        state.targetExpansion = 0.18;
+        state.targetVisibleCount = MIN_VISIBLE_PARTICLES;
+        state.targetGlow = 0.95 + state.targetDepthPower * 1.2;
+      } else {
+        state.targetExpansion = 0.58;
+        state.targetVisibleCount = 8500;
+        state.targetGlow = 1.0 + state.targetDepthPower * 1.0;
+      }
+    }
+
+    async function startHands() {
+      try {
+        if (!window.Hands || !window.Camera) {
+          throw new Error("MediaPipe 依赖未加载");
+        }
+
+        const hands = new Hands({
+          locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+          maxNumHands: 1,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.64,
+          minTrackingConfidence: 0.58
+        });
+
+        hands.onResults(results => {
+          if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const classified = classifyHand(results.multiHandLandmarks[0]);
+            applyGesture(classified);
+            cameraStatus.textContent = "识别中";
+            cameraDot.classList.add("ok");
+          }
+        });
+
+        const mpCamera = new Camera(video, {
+          width: 640,
+          height: 480,
+          onFrame: async () => {
+            await hands.send({ image: video });
+          }
+        });
+
+        await mpCamera.start();
+        cameraStatus.textContent = "已启动";
+        cameraDot.classList.add("ok");
+      } catch (error) {
+        console.warn(error);
+        cameraStatus.textContent = "不可用";
+        cameraDot.classList.remove("ok");
+        gestureStatus.textContent = "摄像头失败";
+      }
+    }
+
+    // =========================
+    // 动画主循环
+    // =========================
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const elapsed = clock.getElapsedTime();
+      const dt = Math.min(clock.getDelta(), 0.033);
+
+      // 若短时间没有检测到手，回到柔和待机状态
+      if (performance.now() - state.lastHandSeen > 1400) {
+        state.targetGesture = "等待识别";
+        state.targetExpansion = 0.52;
+        state.targetVisibleCount = 7600;
+        state.targetGlow = 0.88;
+        state.targetDepthPower = 0;
+        state.targetFlowX *= 0.94;
+      }
+
+      // 平滑过渡，避免手势切换突变
+      state.expansion = lerp(state.expansion, state.targetExpansion, 0.045);
+      state.visibleCount = lerp(state.visibleCount, state.targetVisibleCount, 0.04);
+      state.glow = lerp(state.glow, state.targetGlow, 0.055);
+      state.handX = lerp(state.handX, state.targetHandX, 0.075);
+      state.handY = lerp(state.handY, state.targetHandY, 0.075);
+      state.flowX = lerp(state.flowX, state.targetFlowX, 0.055);
+      state.depthPower = lerp(state.depthPower, state.targetDepthPower, 0.065);
+      state.confidence = lerp(state.confidence, state.targetConfidence, 0.08);
+
+      if (state.gesture !== state.targetGesture) {
+        state.gesture = state.targetGesture;
+        gestureStatus.textContent = state.gesture;
+      }
+
+      const visible = Math.floor(clamp(state.visibleCount, MIN_VISIBLE_PARTICLES, MAX_PARTICLES));
+      geometry.setDrawRange(0, visible);
+
+      const redPurpleAmount = state.gesture === "握拳" ? 1.0 : 0.0;
+      const brightness = state.gesture === "张开手掌" ? 1.18 : 1.0;
+      setNebulaColor(elapsed, redPurpleAmount, brightness);
+
+      const expansionRadius = lerp(10, 42, state.expansion);
+      const depthScale = 1 + state.depthPower * 1.75;
+      const glowBoost = state.glow;
+      const flowStrength = state.flowX * 0.026;
+      const handOffsetX = state.handX * 20;
+      const handOffsetY = -state.handY * 10;
+
+      const positionAttr = geometry.attributes.position;
+      const colorAttr = geometry.attributes.color;
+
+      for (let i = 0; i < visible; i++) {
+        const i3 = i * 3;
+        const seed = randomSeed[i];
+
+        // 多层波动模拟流体雾状运动
+        const timeA = elapsed * (0.18 + (seed % 1) * 0.12);
+        const timeB = elapsed * 0.37 + seed;
+
+        const swirl = baseAngles[i]
+          + elapsed * (0.035 + state.expansion * 0.045)
+          + Math.sin(timeB * 0.72) * 0.35;
+
+        const nebulaWave = Math.sin(seed + elapsed * 0.55) * 0.22
+          + Math.sin(seed * 0.37 + elapsed * 0.28) * 0.18;
+
+        const radius = (baseRadius[i] + nebulaWave * 8 + expansionRadius * 0.16)
+          * (0.5 + state.expansion * 1.25)
+          * depthScale;
+
+        const targetX = Math.cos(swirl) * radius + handOffsetX + Math.sin(timeA + seed) * 4;
+        const targetY = baseHeight[i] * (0.7 + state.expansion * 1.12) + handOffsetY + Math.cos(timeA * 1.3 + seed) * 5;
+        const targetZ = Math.sin(swirl) * radius * 0.8 + Math.cos(timeB * 0.8) * 16;
+
+        // 手左右移动带来拖尾流向
+        velocities[i3] += (targetX - positions[i3]) * 0.0045 + flowStrength;
+        velocities[i3 + 1] += (targetY - positions[i3 + 1]) * 0.004;
+        velocities[i3 + 2] += (targetZ - positions[i3 + 2]) * 0.004;
+
+        // 张开时向外扩散，握拳时向中心收缩
+        if (state.gesture === "张开手掌") {
+          velocities[i3] += positions[i3] * 0.00022;
+          velocities[i3 + 1] += positions[i3 + 1] * 0.00012;
+          velocities[i3 + 2] += positions[i3 + 2] * 0.00018;
+        } else if (state.gesture === "握拳") {
+          velocities[i3] += -positions[i3] * 0.00055;
+          velocities[i3 + 1] += -positions[i3 + 1] * 0.00055;
+          velocities[i3 + 2] += -positions[i3 + 2] * 0.00055;
+        }
+
+        velocities[i3] *= 0.94;
+        velocities[i3 + 1] *= 0.94;
+        velocities[i3 + 2] *= 0.94;
+
+        positions[i3] += velocities[i3] * (1 + dt * 16);
+        positions[i3 + 1] += velocities[i3 + 1] * (1 + dt * 16);
+        positions[i3 + 2] += velocities[i3 + 2] * (1 + dt * 16);
+
+        // 彩色星云渐变
+        const colorMix = (Math.sin(seed + elapsed * 0.4) + 1) * 0.5;
+        if (colorMix < 0.5) {
+          tempColor.copy(colorA).lerp(colorB, colorMix * 2);
+        } else {
+          tempColor.copy(colorB).lerp(colorC, (colorMix - 0.5) * 2);
+        }
+
+        const zBrightness = clamp((positions[i3 + 2] + 70) / 130, 0.25, 1.25) * glowBoost;
+        colors[i3] = tempColor.r * zBrightness;
+        colors[i3 + 1] = tempColor.g * zBrightness;
+        colors[i3 + 2] = tempColor.b * zBrightness;
+      }
+
+      positionAttr.needsUpdate = true;
+      colorAttr.needsUpdate = true;
+
+      // 手向前靠近摄像头时粒子变大、发光增强
+      particleMaterial.size = lerp(particleMaterial.size, 0.74 + state.depthPower * 1.95, 0.05);
+      particleMaterial.opacity = lerp(particleMaterial.opacity, 0.58 + state.glow * 0.18, 0.04);
+      hazeMaterial.size = lerp(hazeMaterial.size, 2.1 + state.depthPower * 4.2, 0.04);
+      hazeMaterial.opacity = lerp(hazeMaterial.opacity, 0.10 + state.glow * 0.055, 0.04);
+
+      // 整体缓慢漂浮和空间旋转
+      particles.rotation.y = elapsed * 0.035 + state.handX * 0.16;
+      particles.rotation.x = Math.sin(elapsed * 0.19) * 0.08 + state.handY * 0.08;
+      haze.rotation.copy(particles.rotation);
+      haze.rotation.z = Math.sin(elapsed * 0.14) * 0.08;
+
+      stars.rotation.y = elapsed * 0.008;
+      stars.rotation.x = Math.sin(elapsed * 0.07) * 0.02;
+
+      camera3D.position.x = lerp(camera3D.position.x, state.handX * 4.5, 0.03);
+      camera3D.position.y = lerp(camera3D.position.y, -state.handY * 3.0, 0.03);
+      camera3D.lookAt(0, 0, 0);
+
+      renderer.render(scene, camera3D);
+    }
+
+    // =========================
+    // 窗口自适应
+    // =========================
+    function resize() {
+      camera3D.aspect = window.innerWidth / window.innerHeight;
+      camera3D.updateProjectionMatrix();
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    window.addEventListener("resize", resize);
+
+    // =========================
+    // 启动
+    // =========================
+    gestureStatus.textContent = "等待识别";
+    startHands();
+    animate();
+  </script>
+</body>
+</html>
